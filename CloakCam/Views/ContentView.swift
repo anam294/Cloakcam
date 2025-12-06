@@ -1,119 +1,211 @@
 import SwiftUI
 import PhotosUI
 
+// Wrapper types for fullScreenCover item binding
+struct SelectedImage: Identifiable {
+    let id = UUID()
+    let image: UIImage
+}
+
+struct SelectedVideo: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
 struct ContentView: View {
-    @StateObject private var viewModel = ContentViewModel()
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var selectedVideoItem: PhotosPickerItem?
+    @State private var selectedImage: SelectedImage?
+    @State private var selectedVideo: SelectedVideo?
+    @State private var isLoading = false
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 40) {
-                Spacer()
+            ZStack {
+                // Background gradient
+                LinearGradient(
+                    colors: [Color.blue.opacity(0.1), Color.purple.opacity(0.1)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
 
-                Text("CloakCam")
-                    .font(.largeTitle)
-                    .fontWeight(.bold)
+                VStack(spacing: 32) {
+                    Spacer()
 
-                Text("Blur faces in photos and videos")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-
-                if case .processing(let progress) = viewModel.processingState {
+                    // App icon and title
                     VStack(spacing: 16) {
-                        ProgressView(value: progress)
-                            .progressViewStyle(.linear)
-                            .frame(width: 200)
+                        Image(systemName: "eye.slash.circle.fill")
+                            .font(.system(size: 80))
+                            .foregroundStyle(
+                                LinearGradient(
+                                    colors: [.blue, .purple],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
 
-                        Text("Processing... \(Int(progress * 100))%")
-                            .font(.caption)
+                        Text("CloakCam")
+                            .font(.largeTitle)
+                            .fontWeight(.bold)
+
+                        Text("Hide faces with blur, pixels, or emoji")
+                            .font(.subheadline)
                             .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
                     }
-                    .padding()
-                } else {
-                    VStack(spacing: 20) {
-                        PhotosPicker(
-                            selection: $selectedPhotoItem,
-                            matching: .images
-                        ) {
-                            Label("Select Photo", systemImage: "photo")
-                                .frame(maxWidth: .infinity)
-                                .padding()
-                                .background(Color.blue)
-                                .foregroundColor(.white)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                        }
-                        .frame(width: 200)
 
-                        PhotosPicker(
-                            selection: $selectedVideoItem,
-                            matching: .videos
-                        ) {
-                            Label("Select Video", systemImage: "video")
-                                .frame(maxWidth: .infinity)
-                                .padding()
-                                .background(Color.green)
-                                .foregroundColor(.white)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                        }
-                        .frame(width: 200)
-                    }
-                }
+                    Spacer()
 
-                Spacer()
-            }
-            .padding()
-            .navigationDestination(isPresented: $viewModel.showPhotoResult) {
-                if let photo = viewModel.processedPhoto {
-                    PhotoResultView(processedPhoto: photo) {
-                        viewModel.reset()
+                    if isLoading {
+                        VStack(spacing: 16) {
+                            ProgressView()
+                                .scaleEffect(1.2)
+                            Text("Loading...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(32)
+                    } else {
+                        // Selection buttons
+                        VStack(spacing: 16) {
+                            PhotosPicker(
+                                selection: $selectedPhotoItem,
+                                matching: .images
+                            ) {
+                                HStack {
+                                    Image(systemName: "photo.fill")
+                                        .font(.title2)
+                                    Text("Select Photo")
+                                        .fontWeight(.semibold)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 18)
+                                .background(
+                                    LinearGradient(
+                                        colors: [.blue, .blue.opacity(0.8)],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                                .foregroundColor(.white)
+                                .clipShape(RoundedRectangle(cornerRadius: 16))
+                                .shadow(color: .blue.opacity(0.3), radius: 8, y: 4)
+                            }
+
+                            PhotosPicker(
+                                selection: $selectedVideoItem,
+                                matching: .videos
+                            ) {
+                                HStack {
+                                    Image(systemName: "video.fill")
+                                        .font(.title2)
+                                    Text("Select Video")
+                                        .fontWeight(.semibold)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 18)
+                                .background(
+                                    LinearGradient(
+                                        colors: [.green, .green.opacity(0.8)],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                                .foregroundColor(.white)
+                                .clipShape(RoundedRectangle(cornerRadius: 16))
+                                .shadow(color: .green.opacity(0.3), radius: 8, y: 4)
+                            }
+                        }
+                        .padding(.horizontal, 32)
                     }
+
+                    Spacer()
+
+                    // Footer
+                    Text("Your privacy, protected")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .padding(.bottom)
                 }
             }
-            .navigationDestination(isPresented: $viewModel.showVideoResult) {
-                if let video = viewModel.processedVideo {
-                    VideoResultView(processedVideo: video) {
-                        viewModel.reset()
+            .fullScreenCover(item: $selectedImage) { selected in
+                PhotoEditorView(originalImage: selected.image)
+                    .onDisappear {
+                        selectedPhotoItem = nil
                     }
-                }
+            }
+            .fullScreenCover(item: $selectedVideo) { selected in
+                VideoEditorView(videoURL: selected.url)
+                    .onDisappear {
+                        selectedVideoItem = nil
+                    }
             }
             .onChange(of: selectedPhotoItem) { _, newValue in
                 if newValue != nil {
                     Task {
-                        await viewModel.processSelectedPhoto(newValue)
-                        selectedPhotoItem = nil
+                        await loadPhoto(from: newValue)
                     }
                 }
             }
             .onChange(of: selectedVideoItem) { _, newValue in
-                if let item = newValue {
+                if newValue != nil {
                     Task {
-                        await loadAndProcessVideo(item: item)
-                        selectedVideoItem = nil
+                        await loadVideo(from: newValue)
                     }
                 }
-            }
-            .alert("Error", isPresented: $viewModel.showError) {
-                Button("OK") {
-                    viewModel.reset()
-                }
-            } message: {
-                Text(viewModel.errorMessage ?? "An unknown error occurred.")
             }
         }
     }
 
-    private func loadAndProcessVideo(item: PhotosPickerItem) async {
+    private func loadPhoto(from item: PhotosPickerItem?) async {
+        guard let item = item else { return }
+
+        print("📷 [ContentView] Loading photo from picker...")
+        await MainActor.run {
+            isLoading = true
+        }
+
         do {
-            guard let movie = try await item.loadTransferable(type: VideoTransferable.self) else {
+            guard let data = try await item.loadTransferable(type: Data.self),
+                  let image = UIImage(data: data) else {
+                print("📷 [ContentView] Failed to load image data")
+                await MainActor.run { isLoading = false }
                 return
             }
-            await viewModel.processSelectedVideo(url: movie.url)
+
+            print("📷 [ContentView] Photo loaded: \(image.size), showing editor")
+            await MainActor.run {
+                isLoading = false
+                selectedImage = SelectedImage(image: image)
+            }
         } catch {
-            viewModel.errorMessage = error.localizedDescription
-            viewModel.showError = true
+            print("📷 [ContentView] Failed to load photo: \(error)")
+            await MainActor.run { isLoading = false }
+        }
+    }
+
+    private func loadVideo(from item: PhotosPickerItem?) async {
+        guard let item = item else { return }
+
+        await MainActor.run {
+            isLoading = true
+        }
+
+        do {
+            guard let movie = try await item.loadTransferable(type: VideoTransferable.self) else {
+                await MainActor.run { isLoading = false }
+                return
+            }
+
+            print("🎬 [ContentView] Video loaded, showing editor")
+            await MainActor.run {
+                isLoading = false
+                selectedVideo = SelectedVideo(url: movie.url)
+            }
+        } catch {
+            print("🎬 [ContentView] Failed to load video: \(error)")
+            await MainActor.run { isLoading = false }
         }
     }
 }
