@@ -13,6 +13,11 @@ struct FaceRegionOverlay: View {
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
+            // Tappable background (invisible but captures taps)
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white.opacity(0.001)) // Nearly invisible but tappable
+                .frame(width: displayRect.width, height: displayRect.height)
+
             // Border rectangle
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(
@@ -44,13 +49,8 @@ struct FaceRegionOverlay: View {
                 if region.isEnabled {
                     HStack {
                         HStack(spacing: 4) {
-                            if region.coverType == .emoji {
-                                Text(region.emoji)
-                                    .font(.system(size: 14))
-                            } else {
-                                Image(systemName: region.coverType.iconName)
-                                    .font(.system(size: 12))
-                            }
+                            Image(systemName: region.coverType.iconName)
+                                .font(.system(size: 12))
                             Text(region.coverType.rawValue)
                                 .font(.caption2)
                                 .fontWeight(.medium)
@@ -66,6 +66,7 @@ struct FaceRegionOverlay: View {
             }
             .frame(width: displayRect.width, height: displayRect.height)
         }
+        .contentShape(Rectangle()) // Makes entire area tappable
         .opacity(region.isEnabled ? 1.0 : 0.5)
         .position(x: displayRect.midX, y: displayRect.midY)
         .onTapGesture {

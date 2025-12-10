@@ -20,10 +20,26 @@ final class PhotoProcessor {
             throw ProcessingError.invalidImage
         }
 
-        let normalizedRects = try await detectFaceRects(in: cgImage)
+        let orientation = cgImageOrientation(from: image.imageOrientation)
+        let normalizedRects = try await detectFaceRects(in: cgImage, orientation: orientation)
 
         return normalizedRects.map { rect in
             FaceRegion(normalizedRect: rect)
+        }
+    }
+
+    // Convert UIImage orientation to CGImagePropertyOrientation
+    private func cgImageOrientation(from uiOrientation: UIImage.Orientation) -> CGImagePropertyOrientation {
+        switch uiOrientation {
+        case .up: return .up
+        case .down: return .down
+        case .left: return .left
+        case .right: return .right
+        case .upMirrored: return .upMirrored
+        case .downMirrored: return .downMirrored
+        case .leftMirrored: return .leftMirrored
+        case .rightMirrored: return .rightMirrored
+        @unknown default: return .up
         }
     }
 
@@ -38,14 +54,17 @@ final class PhotoProcessor {
             return image
         }
 
-        var ciImage = CIImage(cgImage: cgImage)
-        let imageSize = CGSize(width: cgImage.width, height: cgImage.height)
+        // Create CIImage with orientation so it matches Vision's coordinate space
+        let orientation = cgImageOrientation(from: image.imageOrientation)
+        var ciImage = CIImage(cgImage: cgImage).oriented(orientation)
+
+        // Use the oriented image size (may be swapped for rotated images)
+        let imageSize = ciImage.extent.size
 
         for region in enabledRegions {
             let config = FaceRegionConfig(
                 normalizedRect: region.normalizedRect,
-                coverType: region.coverType,
-                emoji: region.emoji
+                coverType: region.coverType
             )
             ciImage = applyEffect(to: ciImage, config: config, imageSize: imageSize)
         }
@@ -54,7 +73,8 @@ final class PhotoProcessor {
             throw ProcessingError.renderingFailed
         }
 
-        return UIImage(cgImage: outputCGImage, scale: image.scale, orientation: image.imageOrientation)
+        // Output is already oriented correctly, use .up
+        return UIImage(cgImage: outputCGImage, scale: image.scale, orientation: .up)
     }
 
     // MARK: - Legacy method for backward compatibility
@@ -87,7 +107,7 @@ final class PhotoProcessor {
 
     // MARK: - Private Methods
 
-    private func detectFaceRects(in cgImage: CGImage) async throws -> [CGRect] {
+    private func detectFaceRects(in cgImage: CGImage, orientation: CGImagePropertyOrientation = .up) async throws -> [CGRect] {
         return try await withCheckedThrowingContinuation { continuation in
             let request = VNDetectFaceRectanglesRequest { request, error in
                 if let error = error {
@@ -104,7 +124,7 @@ final class PhotoProcessor {
                 continuation.resume(returning: rects)
             }
 
-            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            let handler = VNImageRequestHandler(cgImage: cgImage, orientation: orientation, options: [:])
 
             do {
                 try handler.perform([request])
@@ -123,7 +143,7 @@ final class PhotoProcessor {
             height: config.normalizedRect.height * imageSize.height
         )
 
-        // Expand rect for better coverage
+        // Expand rect for better coverage (matches FaceRegion.displayRect expansion)
         let expandedRect = faceRect.insetBy(dx: -faceRect.width * 0.4, dy: -faceRect.height * 0.5)
 
         switch config.coverType {
@@ -131,8 +151,6 @@ final class PhotoProcessor {
             return applyBlurEffect(to: image, rect: expandedRect)
         case .pixelate:
             return applyPixelateEffect(to: image, rect: expandedRect)
-        case .emoji:
-            return applyEmojiEffect(to: image, rect: expandedRect, emoji: config.emoji)
         }
     }
 
@@ -191,45 +209,6 @@ final class PhotoProcessor {
         blendFilter.maskImage = maskImage
 
         return blendFilter.outputImage ?? image
-    }
-
-    private func applyEmojiEffect(to image: CIImage, rect: CGRect, emoji: String) -> CIImage {
-        // Create emoji image
-        let emojiSize = max(rect.width, rect.height) * 1.2
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: emojiSize, height: emojiSize))
-
-        let emojiUIImage = renderer.image { ctx in
-            let fontSize = emojiSize * 0.85
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: fontSize)
-            ]
-            let emojiString = NSAttributedString(string: emoji, attributes: attributes)
-            let emojiRect = CGRect(
-                x: (emojiSize - emojiString.size().width) / 2,
-                y: (emojiSize - emojiString.size().height) / 2,
-                width: emojiString.size().width,
-                height: emojiString.size().height
-            )
-            emojiString.draw(in: emojiRect)
-        }
-
-        guard let emojiCGImage = emojiUIImage.cgImage else {
-            return image
-        }
-
-        var emojiCIImage = CIImage(cgImage: emojiCGImage)
-
-        // Position emoji over face
-        let translateX = rect.midX - emojiSize / 2
-        let translateY = rect.midY - emojiSize / 2
-        emojiCIImage = emojiCIImage.transformed(by: CGAffineTransform(translationX: translateX, y: translateY))
-
-        // Composite emoji over original image
-        let compositeFilter = CIFilter.sourceOverCompositing()
-        compositeFilter.inputImage = emojiCIImage
-        compositeFilter.backgroundImage = image
-
-        return compositeFilter.outputImage ?? image
     }
 
     // Legacy blur method for backward compatibility

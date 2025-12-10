@@ -42,7 +42,7 @@ final class ContentViewModel: ObservableObject {
         processingState = .processing(progress: 0)
 
         do {
-            let result = try await videoProcessor.processVideo(at: url) { [weak self] progress in
+            let result = try await videoProcessor.processVideo(at: url, coverType: .blur) { [weak self] progress in
                 Task { @MainActor in
                     self?.processingState = .processing(progress: progress)
                 }

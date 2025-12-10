@@ -8,9 +8,6 @@ final class VideoProcessor {
     private let context: CIContext
     private let processingQueue = DispatchQueue(label: "com.cloakcam.videoprocessing", qos: .userInitiated)
 
-    // Pre-rendered emoji images cache for video processing
-    private var emojiCache: [String: CGImage] = [:]
-
     init() {
         if let device = MTLCreateSystemDefaultDevice() {
             context = CIContext(mtlDevice: device, options: [.useSoftwareRenderer: false])
@@ -19,24 +16,13 @@ final class VideoProcessor {
         }
     }
 
-    struct TrackedFace {
-        var id: UUID
-        var rect: CGRect
-        var lastSeen: Int
-        var coverType: CoverType
-        var emoji: String
-    }
-
-    // MARK: - Face Detection for First Frame
-    func detectFacesInFirstFrame(url: URL) async throws -> (thumbnail: UIImage, faces: [FaceRegion]) {
+    // MARK: - Face Detection for First Frame (for thumbnail preview)
+    func detectFacesInFirstFrame(url: URL) async throws -> (thumbnail: UIImage, hasFaces: Bool) {
         let asset = AVAsset(url: url)
 
         guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw ProcessingError.noVideoTrack
         }
-
-        let naturalSize = try await videoTrack.load(.naturalSize)
-        let preferredTransform = try await videoTrack.load(.preferredTransform)
 
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -45,30 +31,26 @@ final class VideoProcessor {
         let cgImage = try generator.copyCGImage(at: .zero, actualTime: nil)
         let thumbnail = UIImage(cgImage: cgImage)
 
-        // Detect faces
-        var faces: [CGRect] = []
+        // Detect faces just to show if there are any
+        var hasFaces = false
         let request = VNDetectFaceRectanglesRequest { req, _ in
-            if let results = req.results as? [VNFaceObservation] {
-                faces = results.map { $0.boundingBox }
+            if let results = req.results as? [VNFaceObservation], !results.isEmpty {
+                hasFaces = true
             }
         }
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         try handler.perform([request])
 
-        let regions = faces.map { FaceRegion(normalizedRect: $0) }
-        return (thumbnail: thumbnail, faces: regions)
+        return (thumbnail: thumbnail, hasFaces: hasFaces)
     }
 
-    // MARK: - Process Video with Custom Regions
+    // MARK: - Process Video with Continuous Face Detection
     func processVideo(
         at url: URL,
-        regions: [FaceRegion],
+        coverType: CoverType,
         progressHandler: @escaping (Double) -> Void
     ) async throws -> ProcessedVideo {
-        print("🎬 [VideoProcessor] Starting video processing with custom regions")
-
-        // Pre-render emojis
-        prepareEmojiCache(for: regions)
+        print("🎬 [VideoProcessor] Starting video processing with \(coverType.rawValue)")
 
         let asset = AVAsset(url: url)
 
@@ -161,80 +143,99 @@ final class VideoProcessor {
         writer.startSession(atSourceTime: .zero)
 
         let totalFrames = max(1, Int(CMTimeGetSeconds(duration) * Double(nominalFrameRate)))
-        let detectionInterval = max(1, Int(nominalFrameRate / 6))
+        // Detect faces every 5 frames for good tracking
+        let detectionInterval = 5
 
-        // Convert regions to configs
-        let enabledConfigs = regions.filter { $0.isEnabled }.map { region in
-            FaceRegionConfig(normalizedRect: region.normalizedRect, coverType: region.coverType, emoji: region.emoji)
-        }
+        print("🎞️ [VideoProcessor] Processing \(totalFrames) frames")
 
-        print("🎞️ [VideoProcessor] Processing \(totalFrames) frames with \(enabledConfigs.count) face regions")
+        // Store the cover type for use in the closure
+        let selectedCoverType = coverType
 
-        let result = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<ProcessedVideo, Error>) in
+        let result: ProcessedVideo = try await withCheckedThrowingContinuation { continuation in
             var processedFrames = 0
-            var trackedFaces: [TrackedFace] = enabledConfigs.map { config in
-                TrackedFace(
-                    id: UUID(),
-                    rect: config.normalizedRect,
-                    lastSeen: 0,
-                    coverType: config.coverType,
-                    emoji: config.emoji
-                )
-            }
+            var lastDetectedFaces: [CGRect] = []
             var videoFinished = false
             var audioFinished = audioInput == nil
+            var hasResumed = false
+            var totalFacesDetected = 0
 
-            videoInput.requestMediaDataWhenReady(on: processingQueue) { [weak self] in
+            let finishProcessing = {
+                guard !hasResumed else { return }
+                hasResumed = true
+
+                DispatchQueue.main.async {
+                    progressHandler(0.95)
+                }
+
+                writer.finishWriting {
+                    if writer.status == .completed {
+                        print("🎉 [VideoProcessor] Complete!")
+                        DispatchQueue.main.async {
+                            progressHandler(1.0)
+                        }
+                        continuation.resume(returning: ProcessedVideo(
+                            originalURL: url,
+                            processedURL: outputURL,
+                            facesDetected: totalFacesDetected
+                        ))
+                    } else {
+                        print("❌ [VideoProcessor] Failed: \(writer.error?.localizedDescription ?? "unknown")")
+                        continuation.resume(throwing: writer.error ?? ProcessingError.videoWriteFailed)
+                    }
+                }
+            }
+
+            videoInput.requestMediaDataWhenReady(on: self.processingQueue) { [weak self] in
                 guard let self = self else { return }
 
                 while videoInput.isReadyForMoreMediaData && !videoFinished {
-                    if let sampleBuffer = videoOutput.copyNextSampleBuffer() {
-                        let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                    autoreleasepool {
+                        if let sampleBuffer = videoOutput.copyNextSampleBuffer() {
+                            let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
-                        if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
-                            // Face detection and tracking
-                            if processedFrames % detectionInterval == 0 {
-                                let detected = self.detectFacesSync(in: pixelBuffer)
-                                trackedFaces = self.updateTrackedFaces(
-                                    existing: trackedFaces,
-                                    detected: detected,
-                                    frameNumber: processedFrames,
-                                    originalConfigs: enabledConfigs
+                            if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                                // Detect faces periodically throughout the video
+                                if processedFrames % detectionInterval == 0 {
+                                    let detected = self.detectFacesSync(in: pixelBuffer)
+                                    if !detected.isEmpty {
+                                        lastDetectedFaces = detected
+                                        totalFacesDetected = max(totalFacesDetected, detected.count)
+                                    }
+                                }
+
+                                // Apply effect to all detected faces
+                                let processed = self.applyEffectToFaces(
+                                    pixelBuffer: pixelBuffer,
+                                    faces: lastDetectedFaces,
+                                    coverType: selectedCoverType
                                 )
+                                adaptor.append(processed, withPresentationTime: time)
+
+                                processedFrames += 1
+
+                                let progress = Double(processedFrames) / Double(totalFrames) * 0.9
+                                if processedFrames % 30 == 0 {
+                                    DispatchQueue.main.async {
+                                        progressHandler(min(progress, 0.9))
+                                    }
+                                }
                             }
+                        } else {
+                            videoFinished = true
+                            videoInput.markAsFinished()
+                            print("✅ [VideoProcessor] Video done: \(processedFrames) frames")
 
-                            // Apply effects
-                            let processed = self.applyEffectsToFaces(pixelBuffer: pixelBuffer, faces: trackedFaces)
-                            adaptor.append(processed, withPresentationTime: time)
-
-                            processedFrames += 1
-                            if processedFrames % 50 == 0 {
-                                print("📈 [VideoProcessor] \(processedFrames)/\(totalFrames)")
-                            }
-
-                            let progress = Double(processedFrames) / Double(totalFrames) * 0.8
-                            DispatchQueue.main.async {
-                                progressHandler(min(progress, 0.8))
+                            if audioFinished {
+                                finishProcessing()
                             }
                         }
-                    } else {
-                        videoFinished = true
-                        videoInput.markAsFinished()
-                        print("✅ [VideoProcessor] Video done: \(processedFrames) frames")
-
-                        if audioFinished {
-                            self.finishWriting(writer: writer, outputURL: outputURL, totalFacesDetected: trackedFaces.count, url: url, progressHandler: progressHandler, continuation: continuation)
-                        }
-                        break
                     }
                 }
             }
 
             // Process audio
             if let ai = audioInput, let ao = audioOutput {
-                ai.requestMediaDataWhenReady(on: processingQueue) { [weak self] in
-                    guard let self = self else { return }
-
+                ai.requestMediaDataWhenReady(on: self.processingQueue) {
                     while ai.isReadyForMoreMediaData && !audioFinished {
                         if let buffer = ao.copyNextSampleBuffer() {
                             ai.append(buffer)
@@ -244,7 +245,7 @@ final class VideoProcessor {
                             print("✅ [VideoProcessor] Audio done")
 
                             if videoFinished {
-                                self.finishWriting(writer: writer, outputURL: outputURL, totalFacesDetected: trackedFaces.count, url: url, progressHandler: progressHandler, continuation: continuation)
+                                finishProcessing()
                             }
                             break
                         }
@@ -256,75 +257,7 @@ final class VideoProcessor {
         return result
     }
 
-    // MARK: - Legacy Method
-    func processVideo(
-        at url: URL,
-        progressHandler: @escaping (Double) -> Void
-    ) async throws -> ProcessedVideo {
-        // Detect faces and process with blur
-        let (_, faces) = try await detectFacesInFirstFrame(url: url)
-        return try await processVideo(at: url, regions: faces, progressHandler: progressHandler)
-    }
-
     // MARK: - Private Methods
-
-    private func prepareEmojiCache(for regions: [FaceRegion]) {
-        emojiCache.removeAll()
-        let emojis = Set(regions.filter { $0.coverType == .emoji }.map { $0.emoji })
-
-        for emoji in emojis {
-            // Create larger emoji for video
-            let size: CGFloat = 512
-            let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size))
-            let image = renderer.image { _ in
-                let attributes: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.systemFont(ofSize: size * 0.85)
-                ]
-                let string = NSAttributedString(string: emoji, attributes: attributes)
-                let stringSize = string.size()
-                let rect = CGRect(
-                    x: (size - stringSize.width) / 2,
-                    y: (size - stringSize.height) / 2,
-                    width: stringSize.width,
-                    height: stringSize.height
-                )
-                string.draw(in: rect)
-            }
-            if let cgImage = image.cgImage {
-                emojiCache[emoji] = cgImage
-            }
-        }
-    }
-
-    private func finishWriting(
-        writer: AVAssetWriter,
-        outputURL: URL,
-        totalFacesDetected: Int,
-        url: URL,
-        progressHandler: @escaping (Double) -> Void,
-        continuation: CheckedContinuation<ProcessedVideo, Error>
-    ) {
-        DispatchQueue.main.async {
-            progressHandler(0.95)
-        }
-
-        writer.finishWriting {
-            if writer.status == .completed {
-                print("🎉 [VideoProcessor] Complete!")
-                DispatchQueue.main.async {
-                    progressHandler(1.0)
-                }
-                continuation.resume(returning: ProcessedVideo(
-                    originalURL: url,
-                    processedURL: outputURL,
-                    facesDetected: totalFacesDetected
-                ))
-            } else {
-                print("❌ [VideoProcessor] Failed: \(writer.error?.localizedDescription ?? "unknown")")
-                continuation.resume(throwing: writer.error ?? ProcessingError.videoWriteFailed)
-            }
-        }
-    }
 
     private func detectFacesSync(in pixelBuffer: CVPixelBuffer) -> [CGRect] {
         var faces: [CGRect] = []
@@ -338,69 +271,29 @@ final class VideoProcessor {
         return faces
     }
 
-    private func updateTrackedFaces(
-        existing: [TrackedFace],
-        detected: [CGRect],
-        frameNumber: Int,
-        originalConfigs: [FaceRegionConfig]
-    ) -> [TrackedFace] {
-        var updated = existing
-        var matched = Set<Int>()
+    private func applyEffectToFaces(pixelBuffer: CVPixelBuffer, faces: [CGRect], coverType: CoverType) -> CVPixelBuffer {
+        guard !faces.isEmpty else { return pixelBuffer }
 
-        for i in 0..<updated.count {
-            var best: (idx: Int, iou: CGFloat)?
-            for (j, rect) in detected.enumerated() where !matched.contains(j) {
-                let iou = calculateIoU(updated[i].rect, rect)
-                if iou > 0.3 && (best == nil || iou > best!.iou) {
-                    best = (j, iou)
-                }
-            }
-            if let b = best {
-                let old = updated[i].rect
-                let new = detected[b.idx]
-                updated[i].rect = CGRect(
-                    x: old.origin.x * 0.3 + new.origin.x * 0.7,
-                    y: old.origin.y * 0.3 + new.origin.y * 0.7,
-                    width: old.width * 0.3 + new.width * 0.7,
-                    height: old.height * 0.3 + new.height * 0.7
-                )
-                updated[i].lastSeen = frameNumber
-                matched.insert(b.idx)
-            }
-        }
-
-        // Don't add new faces in custom mode - only track the ones user selected
-        return updated.filter { frameNumber - $0.lastSeen < 30 }
-    }
-
-    private func calculateIoU(_ r1: CGRect, _ r2: CGRect) -> CGFloat {
-        let intersection = r1.intersection(r2)
-        guard !intersection.isNull else { return 0 }
-        let iArea = intersection.width * intersection.height
-        let uArea = r1.width * r1.height + r2.width * r2.height - iArea
-        return uArea > 0 ? iArea / uArea : 0
-    }
-
-    private func applyEffectsToFaces(pixelBuffer: CVPixelBuffer, faces: [TrackedFace]) -> CVPixelBuffer {
         let w = CVPixelBufferGetWidth(pixelBuffer)
         let h = CVPixelBufferGetHeight(pixelBuffer)
         var img = CIImage(cvPixelBuffer: pixelBuffer)
 
         for face in faces {
-            let rect = CGRect(
-                x: face.rect.origin.x * CGFloat(w),
-                y: face.rect.origin.y * CGFloat(h),
-                width: face.rect.width * CGFloat(w),
-                height: face.rect.height * CGFloat(h)
-            ).insetBy(dx: -face.rect.width * CGFloat(w) * 0.4, dy: -face.rect.height * CGFloat(h) * 0.5)
+            let faceRect = CGRect(
+                x: face.origin.x * CGFloat(w),
+                y: face.origin.y * CGFloat(h),
+                width: face.width * CGFloat(w),
+                height: face.height * CGFloat(h)
+            )
 
-            switch face.coverType {
+            // Expanded rect for better coverage
+            let expandedRect = faceRect.insetBy(dx: -faceRect.width * 0.4, dy: -faceRect.height * 0.5)
+
+            switch coverType {
             case .blur:
-                img = applyBlurEffect(to: img, rect: rect)
+                img = applyBlurEffect(to: img, rect: expandedRect)
             case .pixelate:
-                img = applyPixelateEffect(to: img, rect: rect)
-            case .emoji:
-                img = applyEmojiEffect(to: img, rect: rect, emoji: face.emoji)
+                img = applyPixelateEffect(to: img, rect: expandedRect)
             }
         }
 
@@ -454,27 +347,5 @@ final class VideoProcessor {
         blend.backgroundImage = image
         blend.maskImage = maskImg
         return blend.outputImage ?? image
-    }
-
-    private func applyEmojiEffect(to image: CIImage, rect: CGRect, emoji: String) -> CIImage {
-        guard let emojiCGImage = emojiCache[emoji] else { return image }
-
-        let emojiSize = max(rect.width, rect.height) * 1.2
-        var emojiCIImage = CIImage(cgImage: emojiCGImage)
-
-        // Scale emoji to fit
-        let scale = emojiSize / CGFloat(emojiCGImage.width)
-        emojiCIImage = emojiCIImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-
-        // Position emoji
-        let translateX = rect.midX - emojiSize / 2
-        let translateY = rect.midY - emojiSize / 2
-        emojiCIImage = emojiCIImage.transformed(by: CGAffineTransform(translationX: translateX, y: translateY))
-
-        let composite = CIFilter.sourceOverCompositing()
-        composite.inputImage = emojiCIImage
-        composite.backgroundImage = image
-
-        return composite.outputImage ?? image
     }
 }

@@ -4,7 +4,6 @@ import CoreGraphics
 enum CoverType: String, CaseIterable, Identifiable {
     case blur = "Blur"
     case pixelate = "Pixelate"
-    case emoji = "Emoji"
 
     var id: String { rawValue }
 
@@ -12,7 +11,6 @@ enum CoverType: String, CaseIterable, Identifiable {
         switch self {
         case .blur: return "drop.fill"
         case .pixelate: return "square.grid.3x3.fill"
-        case .emoji: return "face.smiling.fill"
         }
     }
 }
@@ -21,20 +19,17 @@ struct FaceRegion: Identifiable, Equatable {
     let id: UUID
     var normalizedRect: CGRect  // Vision coordinates (0-1, bottom-left origin)
     var coverType: CoverType
-    var emoji: String
     var isEnabled: Bool
 
     init(
         id: UUID = UUID(),
         normalizedRect: CGRect,
         coverType: CoverType = .blur,
-        emoji: String = "😀",
         isEnabled: Bool = true
     ) {
         self.id = id
         self.normalizedRect = normalizedRect
         self.coverType = coverType
-        self.emoji = emoji
         self.isEnabled = isEnabled
     }
 
@@ -62,5 +57,4 @@ struct FaceRegion: Identifiable, Equatable {
 struct FaceRegionConfig {
     let normalizedRect: CGRect
     let coverType: CoverType
-    let emoji: String
 }

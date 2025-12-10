@@ -8,13 +8,10 @@ struct PhotoEditorView: View {
     @State private var isDetecting = true
     @State private var isProcessing = false
     @State private var processedImage: UIImage?
-    @State private var showEmojiPicker = false
     @State private var showShareSheet = false
     @State private var showSaveSuccess = false
     @State private var showSaveError = false
     @State private var saveErrorMessage = ""
-    @State private var displayedImageSize: CGSize = .zero
-    @State private var imageOffset: CGPoint = .zero
 
     @Environment(\.dismiss) private var dismiss
 
@@ -44,7 +41,6 @@ struct PhotoEditorView: View {
                             // Face region overlays (only show when not processed)
                             if processedImage == nil && !isDetecting {
                                 ForEach(faceRegions) { region in
-                                    let rect = region.displayRect(in: fitSize)
                                     FaceRegionOverlay(
                                         region: region,
                                         imageSize: fitSize,
@@ -116,14 +112,8 @@ struct PhotoEditorView: View {
                            let index = faceRegions.firstIndex(where: { $0.id == selectedId }),
                            faceRegions[index].isEnabled,
                            processedImage == nil {
-                            CoverTypePicker(
-                                selectedType: $faceRegions[index].coverType,
-                                selectedEmoji: $faceRegions[index].emoji,
-                                onEmojiPickerTap: {
-                                    showEmojiPicker = true
-                                }
-                            )
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                            CoverTypePicker(selectedType: $faceRegions[index].coverType)
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
 
                         // Action buttons
@@ -193,12 +183,6 @@ struct PhotoEditorView: View {
                     Button("Cancel") {
                         dismiss()
                     }
-                }
-            }
-            .sheet(isPresented: $showEmojiPicker) {
-                if let selectedId = selectedRegionId,
-                   let index = faceRegions.firstIndex(where: { $0.id == selectedId }) {
-                    EmojiPicker(selectedEmoji: $faceRegions[index].emoji)
                 }
             }
             .sheet(isPresented: $showShareSheet) {

@@ -5,14 +5,13 @@ import Photos
 struct VideoEditorView: View {
     let videoURL: URL
     @State private var thumbnail: UIImage?
-    @State private var faceRegions: [FaceRegion] = []
-    @State private var selectedRegionId: UUID?
-    @State private var isDetecting = true
+    @State private var hasFaces: Bool = false
+    @State private var isLoading = true
+    @State private var selectedCoverType: CoverType = .blur
     @State private var isProcessing = false
     @State private var processingProgress: Double = 0
     @State private var processedVideoURL: URL?
     @State private var player: AVPlayer?
-    @State private var showEmojiPicker = false
     @State private var showShareSheet = false
     @State private var showSaveSuccess = false
     @State private var showSaveError = false
@@ -28,68 +27,39 @@ struct VideoEditorView: View {
                 Color.black.ignoresSafeArea()
 
                 VStack(spacing: 0) {
-                    // Video/Thumbnail with face overlays
+                    // Video/Thumbnail
                     GeometryReader { geometry in
                         let containerSize = geometry.size
 
                         ZStack {
-                            if let processed = processedVideoURL, let player = player {
+                            if let processedURL = processedVideoURL, let player = player {
                                 // Show processed video
                                 VideoPlayer(player: player)
                                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                             } else if let thumb = thumbnail {
-                                let fitSize = calculateFitSize(imageSize: thumb.size, containerSize: containerSize)
-                                let offsetX = (containerSize.width - fitSize.width) / 2
-                                let offsetY = (containerSize.height - fitSize.height) / 2
-
-                                // Show thumbnail with overlays
+                                // Show thumbnail
                                 Image(uiImage: thumb)
                                     .resizable()
                                     .scaledToFit()
-                                    .frame(width: fitSize.width, height: fitSize.height)
-                                    .position(x: containerSize.width / 2, y: containerSize.height / 2)
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                                 // Video indicator
-                                if !isDetecting && !isProcessing {
+                                if !isLoading && !isProcessing {
                                     Image(systemName: "video.fill")
                                         .font(.system(size: 40))
                                         .foregroundColor(.white.opacity(0.8))
                                         .padding()
                                         .background(Circle().fill(Color.black.opacity(0.5)))
                                 }
-
-                                // Face region overlays
-                                if !isDetecting && !isProcessing {
-                                    ForEach(faceRegions) { region in
-                                        FaceRegionOverlay(
-                                            region: region,
-                                            imageSize: fitSize,
-                                            isSelected: selectedRegionId == region.id,
-                                            onSelect: {
-                                                withAnimation(.spring(response: 0.3)) {
-                                                    selectedRegionId = region.id
-                                                }
-                                            },
-                                            onToggle: {
-                                                withAnimation(.spring(response: 0.3)) {
-                                                    if let index = faceRegions.firstIndex(where: { $0.id == region.id }) {
-                                                        faceRegions[index].isEnabled.toggle()
-                                                    }
-                                                }
-                                            }
-                                        )
-                                        .offset(x: offsetX, y: offsetY)
-                                    }
-                                }
                             }
 
                             // Loading overlay
-                            if isDetecting {
+                            if isLoading {
                                 VStack(spacing: 16) {
                                     ProgressView()
                                         .scaleEffect(1.5)
                                         .tint(.white)
-                                    Text("Analyzing video...")
+                                    Text("Loading video...")
                                         .foregroundColor(.white)
                                         .font(.headline)
                                 }
@@ -109,7 +79,7 @@ struct VideoEditorView: View {
                                         .foregroundColor(.white)
                                         .font(.headline)
 
-                                    Text("This may take a moment")
+                                    Text("Detecting and hiding faces throughout")
                                         .foregroundColor(.white.opacity(0.7))
                                         .font(.caption)
                                 }
@@ -124,35 +94,23 @@ struct VideoEditorView: View {
 
                     // Bottom controls
                     VStack(spacing: 16) {
-                        // Face count and info
-                        if !isDetecting && processedVideoURL == nil && !isProcessing {
-                            let enabledCount = faceRegions.filter { $0.isEnabled }.count
-                            if faceRegions.isEmpty {
-                                Text("No faces detected in video")
+                        if !isLoading && processedVideoURL == nil && !isProcessing {
+                            // Info text
+                            if hasFaces {
+                                Text("All faces in the video will be hidden")
                                     .foregroundColor(.secondary)
                             } else {
-                                Text("\(enabledCount) of \(faceRegions.count) face\(faceRegions.count == 1 ? "" : "s") will be hidden")
+                                Text("No faces detected in first frame")
                                     .foregroundColor(.secondary)
+                                Text("Faces will still be detected throughout the video")
+                                    .foregroundColor(.secondary)
+                                    .font(.caption)
                             }
-                        }
 
-                        // Cover type picker (show when a region is selected and enabled)
-                        if let selectedId = selectedRegionId,
-                           let index = faceRegions.firstIndex(where: { $0.id == selectedId }),
-                           faceRegions[index].isEnabled,
-                           processedVideoURL == nil && !isProcessing {
-                            CoverTypePicker(
-                                selectedType: $faceRegions[index].coverType,
-                                selectedEmoji: $faceRegions[index].emoji,
-                                onEmojiPickerTap: {
-                                    showEmojiPicker = true
-                                }
-                            )
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                        }
+                            // Cover type picker
+                            CoverTypePicker(selectedType: $selectedCoverType)
 
-                        // Action buttons
-                        if processedVideoURL == nil && !isProcessing {
+                            // Process button
                             Button {
                                 Task {
                                     await processVideo()
@@ -164,11 +122,10 @@ struct VideoEditorView: View {
                                 }
                                 .frame(maxWidth: .infinity)
                                 .padding()
-                                .background(faceRegions.filter { $0.isEnabled }.isEmpty ? Color.gray : Color.blue)
+                                .background(Color.blue)
                                 .foregroundColor(.white)
                                 .clipShape(RoundedRectangle(cornerRadius: 12))
                             }
-                            .disabled(faceRegions.filter { $0.isEnabled }.isEmpty || isDetecting)
                             .padding(.horizontal)
                         } else if processedVideoURL != nil {
                             // Save and Share buttons
@@ -223,12 +180,6 @@ struct VideoEditorView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showEmojiPicker) {
-                if let selectedId = selectedRegionId,
-                   let index = faceRegions.firstIndex(where: { $0.id == selectedId }) {
-                    EmojiPicker(selectedEmoji: $faceRegions[index].emoji)
-                }
-            }
             .sheet(isPresented: $showShareSheet) {
                 if let url = processedVideoURL {
                     ShareSheet(items: [url])
@@ -245,7 +196,7 @@ struct VideoEditorView: View {
                 Text(saveErrorMessage)
             }
             .task {
-                await analyzeVideo()
+                await loadVideo()
             }
             .onDisappear {
                 player?.pause()
@@ -254,41 +205,21 @@ struct VideoEditorView: View {
         }
     }
 
-    private func calculateFitSize(imageSize: CGSize, containerSize: CGSize) -> CGSize {
-        let imageAspect = imageSize.width / imageSize.height
-        let containerAspect = containerSize.width / containerSize.height
+    private func loadVideo() async {
+        print("🎬 [VideoEditor] Loading video: \(videoURL)")
 
-        if imageAspect > containerAspect {
-            let width = containerSize.width
-            let height = width / imageAspect
-            return CGSize(width: width, height: height)
-        } else {
-            let height = containerSize.height
-            let width = height * imageAspect
-            return CGSize(width: width, height: height)
-        }
-    }
-
-    private func analyzeVideo() async {
-        print("🎬 [VideoEditor] Analyzing video at: \(videoURL)")
         do {
-            let result = try await videoProcessor.detectFacesInFirstFrame(url: videoURL)
-            print("🎬 [VideoEditor] Detected \(result.faces.count) faces in first frame")
-            for (i, face) in result.faces.enumerated() {
-                print("🎬 [VideoEditor] Face \(i): \(face.normalizedRect)")
-            }
+            let (thumb, faces) = try await videoProcessor.detectFacesInFirstFrame(url: videoURL)
             await MainActor.run {
-                thumbnail = result.thumbnail
-                faceRegions = result.faces
-                isDetecting = false
-                if let first = result.faces.first {
-                    selectedRegionId = first.id
-                }
+                thumbnail = thumb
+                hasFaces = faces
+                isLoading = false
             }
+            print("🎬 [VideoEditor] Video loaded, faces in first frame: \(faces)")
         } catch {
-            print("🎬 [VideoEditor] Error analyzing video: \(error)")
+            print("🎬 [VideoEditor] Error loading video: \(error)")
             await MainActor.run {
-                isDetecting = false
+                isLoading = false
             }
         }
     }
@@ -300,7 +231,7 @@ struct VideoEditorView: View {
         do {
             let result = try await videoProcessor.processVideo(
                 at: videoURL,
-                regions: faceRegions
+                coverType: selectedCoverType
             ) { progress in
                 Task { @MainActor in
                     processingProgress = progress
